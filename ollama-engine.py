@@ -11,7 +11,7 @@ import shutil
 from datetime import datetime
 from typing import Dict, List, Any
 
-# 新增：导入OpenAI客户端（豆包API依赖）
+#导入OpenAI客户端（豆包API依赖）
 try:
     from openai import OpenAI
 except ImportError:
@@ -76,10 +76,10 @@ class OllamaChatGUI:
         self.external_base_url = "https://ark.cn-beijing.volces.com/api/v3"  # 豆包基础地址
         self.external_model = "doubao-seed-2-0-lite-260215"  # 豆包模型名称
 
-        # ========== 关键修改：提前定义 context_rounds 相关属性 ==========
+        # 定义 context_rounds 相关属性 
         self.context_rounds = 5  # 默认传递最近5轮对话（可在界面配置）
         self.keep_system_prompt = True  # 始终保留系统提示词
-        # ==============================================================
+        
         
         # 初始化UI组件（现在context_rounds已定义，创建控件时不会报错）
         self.create_menu()      # 创建菜单栏
@@ -245,7 +245,11 @@ class OllamaChatGUI:
         # 清空输入框
         self.user_input.delete(1.0, tk.END)
         # 将用户消息添加到消息列表（用于调用API）
-        self.messages.append({"role": "user", "content": user_message})
+        self.messages.append({
+            "role": "user", 
+            "content": user_message,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")  #时间戳
+        })
         
         # 生成当前回复的唯一ID（时间戳，精确到微秒）
         self.current_response_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
@@ -272,7 +276,7 @@ class OllamaChatGUI:
                 "timestamp": datetime.now().strftime("%Y%m%d%H%M%S%f"),
                 "model": self.model if self.api_mode == "ollama" else self.external_model
             },
-            "body": self.messages  # 原始上下文
+            "body": self.messages  # 原始上下文（包含用户/助手消息的时间戳）
         }
         
         # 2. 创建临时文件存储上下文（避免文件冲突）
@@ -314,20 +318,21 @@ class OllamaChatGUI:
         调用API获取模型回复（异步执行）
         支持Ollama本地模式/外部豆包API模式
         """
+        # 1. 获取处理后的上下文（核心：所有模式都基于此上下文发送）
         controlled_context = self.build_controlled_context()
         assistant_response = ""
         thought_process = ""
         
         try:
             if self.api_mode == "ollama":
-                # Ollama本地模式（原有逻辑保留）
+                # Ollama本地模式（修复：使用controlled_context而非self.messages）
                 url = f"{self.ollama_base_url}/api/chat"
                 headers = {"Content-Type": "application/json"}
                 data = {
-            "model": self.model,
-            "messages": controlled_context,  # 替换为受控上下文
-            "stream": True  # 流式响应（逐字返回）
-        }
+                    "model": self.model,
+                    "messages": controlled_context,  # ✅ 修复：使用处理后的上下文
+                    "stream": True
+                }
                 
                 with requests.post(url, headers=headers, json=data, stream=True, timeout=60) as response:
                     if response.status_code != 200:
@@ -338,7 +343,7 @@ class OllamaChatGUI:
                     self.root.after(0, self._start_new_response)
                     
                     for line in response.iter_lines():
-                        if line and not self.is_responding:  # 支持中断回复
+                        if line and not self.is_responding:
                             break
                         if line:
                             line = line.decode('utf-8')
@@ -362,35 +367,30 @@ class OllamaChatGUI:
                                 continue
             
             else:
-                # 外部豆包API模式（新增分支，放入你提供的格式转换代码）
+                # 外部豆包API模式（修复：基于controlled_context构造请求）
                 if not self.external_api_key:
                     self.root.after(0, self._handle_error, "配置错误", "外部API密钥未设置！")
                     return
                 
-                # 先导入OpenAI客户端（如果还没导入，需要在文件顶部加：from openai import OpenAI）
                 from openai import OpenAI
                 client = OpenAI(
                     base_url=self.external_base_url,
                     api_key=self.external_api_key,
                 )
                 
-                # ========== 这里就是你要插入的格式转换代码 ==========
-                # 转换消息格式（包含历史上下文）
+                # 基于controlled_context转换格式 
                 input_messages = []
-                for msg in self.messages:
+                for msg in controlled_context:  # 遍历处理后的上下文
                     if msg["role"] == "system":
-                        # 系统消息直接使用字符串格式
                         input_messages.append({
                             "role": "system",
                             "content": msg["content"]
                         })
                     elif msg["role"] in ["user", "assistant"]:
-                        # 用户/助手消息使用正确的type格式（text而非input_text）
                         input_messages.append({
                             "role": msg["role"],
                             "content": [{"type": "text", "text": msg["content"]}]
                         })
-                # ========== 格式转换代码结束 ==========
                 
                 # 初始化回复显示
                 self.root.after(0, self._start_new_response)
@@ -398,24 +398,28 @@ class OllamaChatGUI:
                 # 调用豆包API（流式响应）
                 stream = client.chat.completions.create(
                     model=self.external_model,
-                    messages=input_messages,
+                    messages=input_messages,  #使用处理后的上下文
                     stream=True,
                     temperature=0.7,
-                    timeout=60  # 超时控制
+                    timeout=60
                 )
                 
                 # 处理流式响应
                 for chunk in stream:
-                    if not self.is_responding:  # 支持中断
+                    if not self.is_responding:
                         break
                     if chunk.choices[0].delta.content:
                         content = chunk.choices[0].delta.content
                         assistant_response += content
                         self.root.after(0, self._update_response, content)
             
-            # 记录回复到消息列表
+            # 记录回复到消息列表（原始列表仍保留全量，用于后续上下文处理）
             if assistant_response:
-                self.messages.append({"role": "assistant", "content": assistant_response})
+                self.messages.append({
+                    "role": "assistant", 
+                    "content": assistant_response,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                })
                 self.root.after(0, self.save_history)
         
         except requests.exceptions.RequestException as e:
@@ -587,26 +591,24 @@ class OllamaChatGUI:
 
     def load_history(self) -> None:
         """
-        从JSON文件加载聊天历史
+        从JSON文件加载聊天历史（兼容时间戳）
         并将历史消息显示到聊天界面
         """
         try:
             if os.path.exists(self.history_file):
                 with open(self.history_file, 'r', encoding='utf-8') as f:
                     history = json.load(f)
-                    # 加载消息列表（默认使用系统提示词）
+                    # 加载消息列表（保留时间戳）
                     self.messages = history.get("messages", [{"role": "system", "content": self.system_prompt}])
                 
-                # 遍历历史消息并显示
+                # 遍历历史消息并显示（忽略时间戳显示，仅展示内容）
                 for msg in self.messages:
                     if msg["role"] == "user":
                         self.display_message(self.user_name, msg["content"])
                     elif msg["role"] == "assistant":
                         self.display_message(self.assistant_name, msg["content"])
         except Exception as e:
-            # 处理加载异常
             self._handle_error("加载聊天历史失败", str(e))
-            # 重置为默认消息列表
             self.messages = [{"role": "system", "content": self.system_prompt}]
 
     def save_config(self) -> None:
@@ -731,31 +733,29 @@ class OllamaChatGUI:
             return
         
         try:
-            # 弹出保存文件对话框
             file_path = filedialog.asksaveasfilename(
                 defaultextension=".txt", 
                 filetypes=[("文本文件", "*.txt")],
                 title="导出聊天记录"
             )
             if file_path:
-                # 写入文本文件
                 with open(file_path, 'w', encoding='utf-8') as f:
                     f.write(f"聊天记录 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                     f.write(f"模式: {self.api_mode} | 模型: {self.model if self.api_mode == 'ollama' else self.external_model}\n\n")
-                    # 遍历消息列表写入
+                    # 遍历消息列表写入（增加时间戳显示）
                     for msg in self.messages:
                         if msg["role"] == "system":
                             f.write(f"系统提示:\n{msg['content']}\n\n")
                         elif msg["role"] == "user":
-                            f.write(f"{self.user_name}:\n{msg['content']}\n\n")
+                            ts = msg.get("timestamp", "无时间戳")
+                            f.write(f"{self.user_name} [{ts}]:\n{msg['content']}\n\n")
                         elif msg["role"] == "assistant":
-                            f.write(f"{self.assistant_name}:\n{msg['content']}\n\n")
-                # 显示导出成功提示
+                            ts = msg.get("timestamp", "无时间戳")
+                            f.write(f"{self.assistant_name} [{ts}]:\n{msg['content']}\n\n")
                 self.display_message(self.system_name, f"已导出至: {file_path}")
         except Exception as e:
-            # 处理导出异常
             self._handle_error("导出失败", str(e))
-
+            
     def set_model(self) -> None:
         """
         设置模型名称
